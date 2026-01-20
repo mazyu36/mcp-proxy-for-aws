@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to checkout'
+        required: false
+        type: string
 
 permissions: {}
 
@@ -25,6 +31,8 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
@@ -61,7 +69,7 @@ jobs:
           uv run --frozen coverage report --fail-under=80
 
       - name: Run pyright
-        run: uv run --frozen pyright
+        run: uv run --frozen --all-packages pyright
 
       - name: Run ruff format
         run: uv run --frozen ruff format .

@@ -1,3 +1,17 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Integration tests for dynamic tool behavior through the proxy."""
 
 import fastmcp
@@ -18,7 +32,7 @@ async def test_proxy_reflects_tool_addition(mcp_client: fastmcp.Client, is_using
     initial_tools = await mcp_client.list_tools()
     initial_tool_names = [tool.name for tool in initial_tools]
 
-    logger.info(f'Initial tools: {initial_tool_names}')
+    logger.info('Initial tools: %s', initial_tool_names)
 
     # Verify 'multiply' tool doesn't exist yet
     assert 'multiply' not in initial_tool_names, 'multiply tool should not exist initially'
@@ -26,13 +40,13 @@ async def test_proxy_reflects_tool_addition(mcp_client: fastmcp.Client, is_using
     # Act - Trigger backend to dynamically add a new tool
     logger.info('Calling add_tool_multiply to add a new tool to the backend')
     add_result = await mcp_client.call_tool('add_tool_multiply', {})
-    logger.info(f'Backend response: {add_result}')
+    logger.info('Backend response: %s', add_result)
 
     # Get updated tool list
     updated_tools = await mcp_client.list_tools()
     updated_tool_names = [tool.name for tool in updated_tools]
 
-    logger.info(f'Updated tools: {updated_tool_names}')
+    logger.info('Updated tools: %s', updated_tool_names)
 
     # Assert
     # The proxy should reflect the newly added tool

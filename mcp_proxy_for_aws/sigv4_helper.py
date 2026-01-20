@@ -16,10 +16,12 @@
 
 import boto3
 import httpx
+import json
 import logging
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
+from functools import partial
 from typing import Any, Dict, Generator, Optional
 
 
@@ -71,55 +73,6 @@ class SigV4HTTPXAuth(httpx.Auth):
         yield request
 
 
-async def _handle_error_response(response: httpx.Response) -> None:
-    """Event hook to handle HTTP error responses and extract details.
-
-    This function is called for every HTTP response to check for errors
-    and provide more detailed error information when requests fail.
-
-    Args:
-        response: The HTTP response object
-
-    Raises:
-        httpx.HTTPStatusError: With enhanced error message containing response details
-    """
-    if response.is_error:
-        try:
-            # Read response content to extract error details
-            await response.aread()
-        except Exception as e:
-            logger.error('Failed to read response: %s', e)
-
-        # Try to extract error details with fallbacks
-        error_msg = ''
-        try:
-            # Try to parse JSON error details
-            error_details = response.json()
-            logger.error('HTTP %d Error Details: %s', response.status_code, error_details)
-            error_msg = f'HTTP {response.status_code}: {error_details} for url {response.url}'
-        except Exception:
-            # If JSON parsing fails, use response text or status code
-            try:
-                response_text = response.text
-                logger.error('HTTP %d Error: %s', response.status_code, response_text)
-                error_msg = f'HTTP {response.status_code}: {response_text} for url {response.url}'
-            except Exception:
-                # Fallback to just status code and URL
-                logger.error('HTTP %d Error for url %s', response.status_code, response.url)
-                error_msg = f'HTTP {response.status_code} Error for url {response.url}'
-
-        # Raise the status error with enhanced message
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            # Replace the error message and throw HTTP error
-            if error_msg:
-                raise httpx.HTTPStatusError(
-                    message=error_msg, request=e.request, response=e.response
-                )
-            raise e
-
-
 def create_aws_session(profile: Optional[str] = None) -> boto3.Session:
     """Create an AWS session with optional profile.
 
@@ -149,58 +102,35 @@ def create_aws_session(profile: Optional[str] = None) -> boto3.Session:
     return session
 
 
-def create_sigv4_auth(service: str, region: str, profile: Optional[str] = None) -> SigV4HTTPXAuth:
-    """Create SigV4 authentication for AWS requests.
-
-    Args:
-        service: AWS service name for SigV4 signing
-        profile: AWS profile to use (optional)
-        region: AWS region (defaults to AWS_REGION env var or us-east-1)
-
-    Returns:
-        SigV4HTTPXAuth instance
-
-    Raises:
-        ValueError: If credentials cannot be obtained
-    """
-    # Create session and get credentials
-    session = create_aws_session(profile)
-    credentials = session.get_credentials()
-
-    # Create SigV4Auth with explicit credentials
-    sigv4_auth = SigV4HTTPXAuth(
-        credentials=credentials,
-        service=service,
-        region=region,
-    )
-
-    logger.info("Created SigV4 authentication for service '%s' in region '%s'", service, region)
-    return sigv4_auth
-
-
 def create_sigv4_client(
     service: str,
     region: str,
     timeout: Optional[httpx.Timeout] = None,
     profile: Optional[str] = None,
+    session: Optional[boto3.Session] = None,
     headers: Optional[Dict[str, str]] = None,
-    auth: Optional[httpx.Auth] = None,
+    metadata: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> httpx.AsyncClient:
     """Create an httpx.AsyncClient with SigV4 authentication.
 
     Args:
         service: AWS service name for SigV4 signing
-        profile: AWS profile to use (optional)
+        profile: AWS profile to use (optional, only used if session is not provided)
+        session: AWS boto3 session to use (optional, takes precedence over profile)
         region: AWS region (optional, defaults to AWS_REGION env var or us-east-1)
         timeout: Timeout configuration for the HTTP client
         headers: Headers to include in requests
-        auth: Auth parameter (ignored as we provide our own)
+        metadata: Metadata to inject into MCP _meta field
         **kwargs: Additional arguments to pass to httpx.AsyncClient
 
     Returns:
         httpx.AsyncClient with SigV4 authentication
     """
+    # Create or use provided AWS session
+    if session is None:
+        session = create_aws_session(profile)
+
     # Create a copy of kwargs to avoid modifying the passed dict
     client_kwargs = {
         'follow_redirects': True,
@@ -219,14 +149,158 @@ def create_sigv4_client(
         'Creating httpx.AsyncClient with custom headers: %s', client_kwargs.get('headers', {})
     )
 
-    # Create SigV4 auth
-    sigv4_auth = create_sigv4_auth(service, region, profile)
-
-    # Create the client with SigV4 auth and error handling event hook
-    logger.info("Creating httpx.AsyncClient with SigV4 authentication for service '%s'", service)
+    logger.info("Creating httpx.AsyncClient with SigV4 request hooks for service '%s'", service)
 
     return httpx.AsyncClient(
-        auth=sigv4_auth,
         **client_kwargs,
-        event_hooks={'response': [_handle_error_response]},
+        event_hooks={
+            'response': [_handle_error_response],
+            'request': [
+                partial(_inject_metadata_hook, metadata or {}),
+                partial(_sign_request_hook, region, service, session),
+            ],
+        },
     )
+
+
+async def _handle_error_response(response: httpx.Response) -> None:
+    """Event hook to handle HTTP error responses and extract details.
+
+    This function is called for every HTTP response to check for errors
+    and provide more detailed error information when requests fail.
+
+    Args:
+        response: The HTTP response object
+
+    Raises:
+        No raises. let the mcp http client handle the errors.
+    """
+    if response.is_error:
+        # warning only because the SDK logs error
+        log_level = logging.WARNING
+        if (
+            # The server MAY respond 405 to GET (SSE) and DELETE (session).
+            response.status_code == 405 and response.request.method in ('GET', 'DELETE')
+        ) or (
+            # The server MAY terminate the session at any time, after which it MUST
+            # respond to requests containing that session ID with HTTP 404 Not Found.
+            response.status_code == 404 and response.request.method == 'POST'
+        ):
+            log_level = logging.DEBUG
+
+        try:
+            # read the content and settle the response content. required to get body (.json(), .text)
+            await response.aread()
+        except Exception as e:
+            logger.debug('Failed to read response: %s', e)
+            # do nothing and let the client and SDK handle the error
+            return
+
+        # Try to extract error details with fallbacks
+        try:
+            # Try to parse JSON error details
+            error_details = response.json()
+            logger.log(log_level, 'HTTP %d Error Details: %s', response.status_code, error_details)
+        except Exception:
+            # If JSON parsing fails, use response text or status code
+            try:
+                response_text = response.text
+                logger.log(log_level, 'HTTP %d Error: %s', response.status_code, response_text)
+            except Exception:
+                # Fallback to just status code and URL
+                logger.log(
+                    log_level, 'HTTP %d Error for url %s', response.status_code, response.url
+                )
+
+
+async def _sign_request_hook(
+    region: str,
+    service: str,
+    session: boto3.Session,
+    request: httpx.Request,
+) -> None:
+    """Request hook to sign HTTP requests with AWS SigV4.
+
+    This hook signs the request with AWS SigV4 credentials and adds signature headers.
+
+    This should be the last hook called to ensure the signature includes any modifications.
+
+    Args:
+        region: AWS region for SigV4 signing
+        service: AWS service name for SigV4 signing
+        session: AWS boto3 session to use for credentials
+        request: The HTTP request object to sign (modified in-place)
+    """
+    # Set Content-Length for signing
+    request.headers['Content-Length'] = str(len(request.content))
+
+    # Get AWS credentials from the session
+    credentials = session.get_credentials()
+    logger.info('Signing request with credentials for access key: %s', credentials.access_key)
+
+    # Create SigV4 auth and use its signing logic
+    auth = SigV4HTTPXAuth(credentials, service, region)
+
+    # Call auth_flow to sign the request (it modifies request in-place)
+    auth_flow = auth.auth_flow(request)
+    next(auth_flow)  # Execute the generator to perform signing
+
+    logger.debug('Request headers after signing: %s', request.headers)
+
+
+async def _inject_metadata_hook(metadata: Dict[str, Any], request: httpx.Request) -> None:
+    """Request hook to inject metadata into MCP calls.
+
+    Args:
+        metadata: Dictionary of metadata to inject into _meta field
+        request: The HTTP request object
+    """
+    logger.debug('=== Outgoing Request ===')
+    logger.debug('URL: %s', request.url)
+    logger.debug('Method: %s', request.method)
+
+    # Try to inject metadata if it's a JSON-RPC/MCP request
+    if request.content and metadata:
+        try:
+            # Parse the request body
+            body = json.loads(await request.aread())
+
+            # Check if it's a JSON-RPC request
+            if isinstance(body, dict) and 'jsonrpc' in body:
+                # Ensure _meta exists in params
+                if '_meta' not in body['params']:
+                    body['params']['_meta'] = {}
+
+                # Get existing metadata
+                existing_meta = body['params']['_meta']
+
+                # Merge metadata (existing takes precedence)
+                if isinstance(existing_meta, dict):
+                    # Check for conflicting keys before merge
+                    conflicting_keys = set(metadata.keys()) & set(existing_meta.keys())
+                    if conflicting_keys:
+                        for key in conflicting_keys:
+                            logger.warning(
+                                'Metadata key "%s" already exists in _meta. '
+                                'Keeping existing value "%s", ignoring injected value "%s"',
+                                key,
+                                existing_meta[key],
+                                metadata[key],
+                            )
+                    body['params']['_meta'] = {**metadata, **existing_meta}
+                else:
+                    logger.debug('Overwriting _meta value with injected metadata')
+                    body['params']['_meta'] = metadata
+
+                # Create new content with updated metadata
+                new_content = json.dumps(body).encode('utf-8')
+
+                # Update the request with new content
+                request.stream = httpx.ByteStream(new_content)
+                request._content = new_content
+
+                logger.info('Injected metadata into _meta: %s', body['params']['_meta'])
+
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            # Not a JSON request or invalid format, skip metadata injection
+            logger.debug('Skipping metadata injection: %s', e)

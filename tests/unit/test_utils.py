@@ -27,21 +27,30 @@ from unittest.mock import MagicMock, patch
 class TestCreateTransportWithSigv4:
     """Test cases for create_transport_with_sigv4 function (line 129)."""
 
+    @patch('mcp_proxy_for_aws.utils.create_aws_session')
     @patch('mcp_proxy_for_aws.utils.create_sigv4_client')
-    def test_create_transport_with_sigv4(self, mock_create_sigv4_client):
+    def test_create_transport_with_sigv4(self, mock_create_sigv4_client, mock_create_session):
         """Test creating StreamableHttpTransport with SigV4 authentication."""
         from httpx import Timeout
 
         mock_client = MagicMock()
         mock_create_sigv4_client.return_value = mock_client
+        mock_session = MagicMock()
+        mock_create_session.return_value = mock_session
 
         url = 'https://test-service.us-west-2.api.aws/mcp'
         service = 'test-service'
         profile = 'test-profile'
         region = 'us-east-1'
+        metadata = {'AWS_REGION': 'us-west-2', 'CUSTOM_KEY': 'custom_value'}
         custom_timeout = Timeout(30.0)
 
-        result = create_transport_with_sigv4(url, service, region, custom_timeout, profile)
+        result = create_transport_with_sigv4(
+            url, service, region, metadata, custom_timeout, profile
+        )
+
+        # Verify session was created with profile
+        mock_create_session.assert_called_once_with(profile)
 
         # Verify result is StreamableHttpTransport
         assert isinstance(result, StreamableHttpTransport)
@@ -56,27 +65,38 @@ class TestCreateTransportWithSigv4:
 
             mock_create_sigv4_client.assert_called_once_with(
                 service=service,
-                profile=profile,
+                session=mock_session,
                 region=region,
                 headers={'test': 'header'},
                 timeout=custom_timeout,
                 auth=None,
+                metadata=metadata,
             )
         else:
             # If we can't access the factory directly, just verify the transport was created
             assert result is not None
 
+    @patch('mcp_proxy_for_aws.utils.create_aws_session')
     @patch('mcp_proxy_for_aws.utils.create_sigv4_client')
-    def test_create_transport_with_sigv4_no_profile(self, mock_create_sigv4_client):
+    def test_create_transport_with_sigv4_no_profile(
+        self, mock_create_sigv4_client, mock_create_session
+    ):
         """Test creating transport without profile."""
         from httpx import Timeout
+
+        mock_session = MagicMock()
+        mock_create_session.return_value = mock_session
 
         url = 'https://test-service.us-west-2.api.aws/mcp'
         service = 'test-service'
         region = 'test-region'
+        metadata = {'AWS_REGION': 'test-forwarding-region'}
         custom_timeout = Timeout(60.0)
 
-        result = create_transport_with_sigv4(url, service, region, custom_timeout)
+        result = create_transport_with_sigv4(url, service, region, metadata, custom_timeout)
+
+        # Verify session was created without profile
+        mock_create_session.assert_called_once_with(None)
 
         # Test that the httpx_client_factory calls create_sigv4_client correctly
         # We need to access the factory through the transport's internal structure
@@ -86,11 +106,12 @@ class TestCreateTransportWithSigv4:
 
             mock_create_sigv4_client.assert_called_once_with(
                 service=service,
+                session=mock_session,
                 region=region,
-                profile=None,
                 headers=None,
                 timeout=custom_timeout,
                 auth=None,
+                metadata=metadata,
             )
         else:
             # If we can't access the factory directly, just verify the transport was created
@@ -129,6 +150,20 @@ class TestValidateRequiredArgs:
         endpoint = 'https://service.subdomain.us-west-2.api.aws'
         result = determine_service_name(endpoint)
         assert result == 'service'
+
+    def test_validate_service_name_bedrock_agentcore(self):
+        """Test parsing service name for bedrock-agentcore endpoints."""
+        # Test various bedrock-agentcore endpoint formats
+        test_cases = [
+            'https://my-agent.gateway.bedrock-agentcore.us-west-2.amazonaws.com',  # Clean gateway
+            'https://bedrock-agentcore.us-east-1.amazonaws.com',  # Clean runtime
+            'https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/arn%3Aaws%3Abedrock-agentcore%3Aus-east-1%3A216123456714%3Aruntime%2Fhosted_agent_99wdf-hYKYrgAHVr/invocations',
+            'https://gateway-quick-start-242206-rsdehprct2.gateway.bedrock-agentcore.eu-central-1.amazonaws.com/mcp',
+        ]
+
+        for endpoint in test_cases:
+            result = determine_service_name(endpoint)
+            assert result == 'bedrock-agentcore', f'Failed for endpoint: {endpoint}'
 
     def test_validate_service_name_service_parsing_simple_hostname(self):
         """Test parsing service from simple hostname."""

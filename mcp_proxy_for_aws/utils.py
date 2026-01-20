@@ -18,10 +18,9 @@ import argparse
 import httpx
 import logging
 import os
-import re
 from fastmcp.client.transports import StreamableHttpTransport
-from mcp_proxy_for_aws.sigv4_helper import create_sigv4_client
-from typing import Dict, Optional
+from mcp_proxy_for_aws.sigv4_helper import create_aws_session, create_sigv4_client
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 
@@ -32,6 +31,7 @@ def create_transport_with_sigv4(
     url: str,
     service: str,
     region: str,
+    metadata: Dict[str, Any],
     custom_timeout: httpx.Timeout,
     profile: Optional[str] = None,
 ) -> StreamableHttpTransport:
@@ -41,6 +41,7 @@ def create_transport_with_sigv4(
         url: The endpoint URL
         service: AWS service name for SigV4 signing
         region: AWS region to use
+        metadata: Metadata dictionary to inject into MCP requests
         custom_timeout: httpx.Timeout used to connect to the endpoint
         profile: AWS profile to use (optional)
 
@@ -48,6 +49,9 @@ def create_transport_with_sigv4(
     Returns:
         StreamableHttpTransport instance with SigV4 authentication
     """
+    # Create AWS session once and reuse it for all httpx clients
+    logger.debug('Creating AWS session with profile: %s', profile)
+    session = create_aws_session(profile)
 
     def client_factory(
         headers: Optional[Dict[str, str]] = None,
@@ -56,10 +60,11 @@ def create_transport_with_sigv4(
     ) -> httpx.AsyncClient:
         return create_sigv4_client(
             service=service,
-            profile=profile,
+            session=session,
             region=region,
             headers=headers,
             timeout=custom_timeout,
+            metadata=metadata,
             auth=auth,
         )
 
@@ -69,8 +74,38 @@ def create_transport_with_sigv4(
     )
 
 
+def get_service_name_and_region_from_endpoint(endpoint: str) -> Tuple[str, str]:
+    """Extract service name and region from an endpoint URL.
+
+    Args:
+        endpoint: The endpoint URL to parse
+
+    Returns:
+        Tuple of (service_name, region). Either value may be empty string if not found.
+
+    Notes:
+        - Matches bedrock-agentcore endpoints (gateway and runtime)
+        - Matches AWS API Gateway endpoints (service.region.api.aws)
+        - Falls back to extracting first hostname segment as service name
+    """
+    # Parse AWS service from endpoint URL
+    parsed = urlparse(endpoint)
+    hostname = parsed.hostname or ''
+    match hostname.split('.'):
+        case [*_, 'bedrock-agentcore', region, 'amazonaws', 'com']:
+            return 'bedrock-agentcore', region  # gateway and runtime
+        case [service, region, 'api', 'aws']:
+            return service, region
+        case [service, *_]:
+            # Fallback: extract first segment as service name
+            return service, ''
+        case _:
+            logger.warning('Could not parse endpoint, no hostname found')
+            return '', ''
+
+
 def determine_service_name(endpoint: str, service: Optional[str] = None) -> str:
-    """Validate and determine the service name.
+    """Validate and determine the service name and possibly region from an endpoint.
 
     Args:
         endpoint: The endpoint URL
@@ -78,6 +113,7 @@ def determine_service_name(endpoint: str, service: Optional[str] = None) -> str:
 
     Returns:
         Validated service name
+        Validated region
 
     Raises:
         ValueError: If service cannot be determined
@@ -85,18 +121,14 @@ def determine_service_name(endpoint: str, service: Optional[str] = None) -> str:
     if service:
         return service
 
-    # Parse AWS service from endpoint URL
-    parsed = urlparse(endpoint)
-    hostname = parsed.hostname or ''
-
-    # Extract service name (first part before first dot or dash)
-    service_match = re.match(r'^([^.]+)', hostname)
-    determined_service = service_match.group(1) if service_match else None
+    logger.info('Resolving service name')
+    endpoint_service, _ = get_service_name_and_region_from_endpoint(endpoint)
+    determined_service = service or endpoint_service
 
     if not determined_service:
         raise ValueError(
-            f"Could not determine AWS service name from endpoint '{endpoint}'. "
-            'Please provide the service name explicitly using --service argument.'
+            f"Could not determine AWS service name and region from endpoint '{endpoint}' and they were not provided."
+            'Please provide the service name explicitly using --service argument and the region via --region argument.'
         )
     return determined_service
 
@@ -119,14 +151,10 @@ def determine_aws_region(endpoint: str, region: Optional[str]) -> str:
         return region
 
     # Parse AWS region from endpoint URL
-    parsed = urlparse(endpoint)
-    hostname = parsed.hostname or ''
-
-    # Extract region name (pattern: service.region.api.aws or service-name.region.api.aws)
-    region_match = re.search(r'\.([a-z0-9-]+)\.api\.aws', hostname)
-    if region_match:
+    _, endpoint_region = get_service_name_and_region_from_endpoint(endpoint)
+    if endpoint_region:
         logger.debug('Region determined through endpoint URL')
-        return region_match.group(1)
+        return endpoint_region
 
     environment_region = os.getenv('AWS_REGION')
     if environment_region:
